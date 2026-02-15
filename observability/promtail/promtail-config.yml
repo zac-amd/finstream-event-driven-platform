@@ -1,0 +1,192 @@
+# =============================================================================
+# FinStream - Promtail Configuration
+# =============================================================================
+# Promtail ships logs from Docker containers to Loki
+# =============================================================================
+
+server:
+  http_listen_port: 9080
+  grpc_listen_port: 0
+
+positions:
+  filename: /tmp/positions.yaml
+
+clients:
+  - url: http://loki:3100/loki/api/v1/push
+    tenant_id: finstream
+    batchwait: 1s
+    batchsize: 1048576
+    timeout: 10s
+
+scrape_configs:
+  # ---------------------------------------------------------------------------
+  # Docker Container Logs
+  # ---------------------------------------------------------------------------
+  - job_name: docker
+    docker_sd_configs:
+      - host: unix:///var/run/docker.sock
+        refresh_interval: 5s
+    relabel_configs:
+      # Keep only finstream containers
+      - source_labels: ['__meta_docker_container_name']
+        regex: '/finstream-.*'
+        action: keep
+      
+      # Extract container name
+      - source_labels: ['__meta_docker_container_name']
+        regex: '/(.*)'
+        target_label: container
+      
+      # Extract service name from compose
+      - source_labels: ['__meta_docker_container_label_com_docker_compose_service']
+        target_label: service
+      
+      # Extract project name
+      - source_labels: ['__meta_docker_container_label_com_docker_compose_project']
+        target_label: project
+      
+      # Set log path
+      - source_labels: ['__meta_docker_container_id']
+        target_label: __path__
+        replacement: /var/lib/docker/containers/$1/$1-json.log
+
+    pipeline_stages:
+      # Parse Docker JSON log format
+      - docker: {}
+      
+      # Parse JSON structured logs
+      - json:
+          expressions:
+            level: level
+            message: message
+            timestamp: timestamp
+            trace_id: trace_id
+            span_id: span_id
+            service: service
+            error: error
+      
+      # Set log level label
+      - labels:
+          level:
+          trace_id:
+          span_id:
+      
+      # Add timestamp
+      - timestamp:
+          source: timestamp
+          format: RFC3339Nano
+          fallback_formats:
+            - RFC3339
+            - UnixMs
+      
+      # Map log levels
+      - labeldrop:
+          - filename
+      
+      # Output structured log
+      - output:
+          source: message
+
+  # ---------------------------------------------------------------------------
+  # FinStream Application Logs (specific parsing)
+  # ---------------------------------------------------------------------------
+  - job_name: finstream-apps
+    docker_sd_configs:
+      - host: unix:///var/run/docker.sock
+        refresh_interval: 5s
+    relabel_configs:
+      # Keep only application containers
+      - source_labels: ['__meta_docker_container_label_com_docker_compose_service']
+        regex: '(market-simulator|stream-processor|aggregation-service|alert-service|api-gateway|query-service)'
+        action: keep
+      
+      - source_labels: ['__meta_docker_container_label_com_docker_compose_service']
+        target_label: service
+      
+      - source_labels: ['__meta_docker_container_id']
+        target_label: __path__
+        replacement: /var/lib/docker/containers/$1/$1-json.log
+
+    pipeline_stages:
+      - docker: {}
+      
+      # Parse application JSON logs
+      - json:
+          expressions:
+            level: level
+            logger: logger
+            message: message
+            timestamp: timestamp
+            trace_id: trace_id
+            span_id: span_id
+            symbol: symbol
+            trade_id: trade_id
+            latency_ms: latency_ms
+            error: error
+            stack_trace: stack_trace
+      
+      # Create labels from extracted fields
+      - labels:
+          level:
+          logger:
+          trace_id:
+          symbol:
+      
+      # Parse timestamp
+      - timestamp:
+          source: timestamp
+          format: RFC3339Nano
+      
+      # Add metrics from logs
+      - metrics:
+          log_lines_total:
+            type: Counter
+            description: "Total log lines by level"
+            prefix: finstream_
+            source: level
+            config:
+              action: inc
+          
+          log_errors_total:
+            type: Counter
+            description: "Total error logs"
+            prefix: finstream_
+            source: level
+            config:
+              value: error
+              action: inc
+
+  # ---------------------------------------------------------------------------
+  # Infrastructure Logs (Redpanda, Redis, TimescaleDB)
+  # ---------------------------------------------------------------------------
+  - job_name: infrastructure
+    docker_sd_configs:
+      - host: unix:///var/run/docker.sock
+        refresh_interval: 5s
+    relabel_configs:
+      - source_labels: ['__meta_docker_container_label_com_docker_compose_service']
+        regex: '(redpanda|redis|timescaledb)'
+        action: keep
+      
+      - source_labels: ['__meta_docker_container_label_com_docker_compose_service']
+        target_label: service
+      
+      - source_labels: ['__meta_docker_container_id']
+        target_label: __path__
+        replacement: /var/lib/docker/containers/$1/$1-json.log
+      
+      # Mark as infrastructure
+      - replacement: infrastructure
+        target_label: component
+
+    pipeline_stages:
+      - docker: {}
+      
+      - regex:
+          expression: '^(?P<timestamp>\S+)\s+(?P<level>\w+)\s+(?P<message>.*)$'
+      
+      - labels:
+          level:
+      
+      - output:
+          source: message
