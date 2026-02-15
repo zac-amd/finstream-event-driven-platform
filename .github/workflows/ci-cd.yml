@@ -1,0 +1,67 @@
+name: FinStream CI/CD
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main]
+
+env:
+  AWS_REGION: us-east-1
+  ECR_REGISTRY: ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.us-east-1.amazonaws.com
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.11' }
+      - name: Install shared lib
+        run: pip install ./shared/python-lib
+      - name: Run tests
+        run: |
+          pip install pytest pytest-asyncio
+          pytest services/*/tests/ -v --tb=short
+
+  build:
+    needs: test
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main'
+    strategy:
+      matrix:
+        service: [market-simulator, stream-processor, alert-service, api-gateway]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+      - uses: aws-actions/amazon-ecr-login@v2
+      - name: Build and push
+        run: |
+          docker build -t $ECR_REGISTRY/finstream/${{ matrix.service }}:${{ github.sha }} \
+            -f services/${{ matrix.service }}/Dockerfile .
+          docker push $ECR_REGISTRY/finstream/${{ matrix.service }}:${{ github.sha }}
+          docker tag $ECR_REGISTRY/finstream/${{ matrix.service }}:${{ github.sha }} \
+            $ECR_REGISTRY/finstream/${{ matrix.service }}:latest
+          docker push $ECR_REGISTRY/finstream/${{ matrix.service }}:latest
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+      - name: Deploy to ECS
+        run: |
+          for svc in market-simulator stream-processor alert-service api-gateway; do
+            aws ecs update-service --cluster finstream-cluster --service $svc \
+              --force-new-deployment --region ${{ env.AWS_REGION }}
+          done
