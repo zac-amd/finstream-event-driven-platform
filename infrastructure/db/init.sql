@@ -304,9 +304,9 @@ SELECT add_compression_policy('candles', INTERVAL '1 day', if_not_exists => TRUE
 -- Function to get latest price for a symbol
 CREATE OR REPLACE FUNCTION get_latest_price(p_symbol TEXT)
 RETURNS TABLE (
-    symbol TEXT,
-    price DECIMAL(18, 8),
-    timestamp TIMESTAMPTZ
+    out_symbol TEXT,
+    out_price DECIMAL(18, 8),
+    out_timestamp TIMESTAMPTZ
 ) AS $$
 BEGIN
     RETURN QUERY
@@ -420,12 +420,324 @@ GRANT ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA public TO finstream;
 GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA public TO finstream;
 
 -- =============================================================================
+-- PORTFOLIO TRACKING TABLES
+-- =============================================================================
+
+-- Enable UUID extension for secure ID generation
+CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
+CREATE EXTENSION IF NOT EXISTS "pgcrypto";
+
+-- Users table for authentication
+CREATE TABLE IF NOT EXISTS users (
+    id              UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    email           TEXT NOT NULL UNIQUE,
+    username        TEXT NOT NULL UNIQUE,
+    password_hash   TEXT NOT NULL,
+    full_name       TEXT,
+    is_active       BOOLEAN DEFAULT TRUE,
+    is_verified     BOOLEAN DEFAULT FALSE,
+    email_verified_at TIMESTAMPTZ,
+    last_login_at   TIMESTAMPTZ,
+    created_at      TIMESTAMPTZ DEFAULT NOW(),
+    updated_at      TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- Create index for login queries
+CREATE INDEX IF NOT EXISTS idx_users_email ON users(email);
+CREATE INDEX IF NOT EXISTS idx_users_username ON users(username);
+
+-- Portfolios table - users can have multiple portfolios
+CREATE TABLE IF NOT EXISTS portfolios (
+    id              UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    user_id         UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    name            TEXT NOT NULL,
+    description     TEXT,
+    is_default      BOOLEAN DEFAULT FALSE,
+    currency        TEXT DEFAULT 'USD',
+    initial_cash    DECIMAL(18, 2) DEFAULT 10000.00,
+    current_cash    DECIMAL(18, 2) DEFAULT 10000.00,
+    is_public       BOOLEAN DEFAULT FALSE,  -- For sharing/leaderboard
+    created_at      TIMESTAMPTZ DEFAULT NOW(),
+    updated_at      TIMESTAMPTZ DEFAULT NOW(),
+    
+    CONSTRAINT unique_default_portfolio UNIQUE (user_id, is_default) 
+        DEFERRABLE INITIALLY DEFERRED
+);
+
+-- Indexes for portfolio queries
+CREATE INDEX IF NOT EXISTS idx_portfolios_user ON portfolios(user_id);
+CREATE INDEX IF NOT EXISTS idx_portfolios_public ON portfolios(is_public) WHERE is_public = TRUE;
+
+-- Holdings table - current positions in each portfolio
+CREATE TABLE IF NOT EXISTS holdings (
+    id              UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    portfolio_id    UUID NOT NULL REFERENCES portfolios(id) ON DELETE CASCADE,
+    symbol          TEXT NOT NULL REFERENCES symbols(symbol),
+    quantity        DECIMAL(18, 8) NOT NULL DEFAULT 0,
+    average_cost    DECIMAL(18, 8) NOT NULL DEFAULT 0,  -- Cost basis per share
+    total_cost      DECIMAL(18, 2) NOT NULL DEFAULT 0,  -- Total invested amount
+    first_bought_at TIMESTAMPTZ,
+    last_traded_at  TIMESTAMPTZ,
+    created_at      TIMESTAMPTZ DEFAULT NOW(),
+    updated_at      TIMESTAMPTZ DEFAULT NOW(),
+    
+    CONSTRAINT unique_portfolio_symbol UNIQUE (portfolio_id, symbol),
+    CONSTRAINT positive_quantity CHECK (quantity >= 0)
+);
+
+-- Indexes for holdings queries
+CREATE INDEX IF NOT EXISTS idx_holdings_portfolio ON holdings(portfolio_id);
+CREATE INDEX IF NOT EXISTS idx_holdings_symbol ON holdings(symbol);
+
+-- Transactions table - complete trade history
+CREATE TABLE IF NOT EXISTS transactions (
+    id              UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    portfolio_id    UUID NOT NULL REFERENCES portfolios(id) ON DELETE CASCADE,
+    symbol          TEXT NOT NULL REFERENCES symbols(symbol),
+    transaction_type TEXT NOT NULL CHECK (transaction_type IN ('BUY', 'SELL', 'DEPOSIT', 'WITHDRAWAL', 'DIVIDEND')),
+    quantity        DECIMAL(18, 8) NOT NULL,
+    price           DECIMAL(18, 8) NOT NULL,  -- Price per share at transaction
+    total_amount    DECIMAL(18, 2) NOT NULL,  -- Total transaction value
+    fees            DECIMAL(18, 2) DEFAULT 0,
+    notes           TEXT,
+    executed_at     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    created_at      TIMESTAMPTZ DEFAULT NOW(),
+    
+    CONSTRAINT positive_transaction CHECK (quantity > 0 AND price > 0)
+);
+
+-- Convert transactions to hypertable for time-series queries
+SELECT create_hypertable(
+    'transactions',
+    'executed_at',
+    chunk_time_interval => INTERVAL '30 days',
+    if_not_exists => TRUE
+);
+
+-- Indexes for transaction queries
+CREATE INDEX IF NOT EXISTS idx_transactions_portfolio_time 
+    ON transactions(portfolio_id, executed_at DESC);
+CREATE INDEX IF NOT EXISTS idx_transactions_symbol_time 
+    ON transactions(symbol, executed_at DESC);
+
+-- Watchlists table - symbols users want to track
+CREATE TABLE IF NOT EXISTS watchlists (
+    id              UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    user_id         UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    name            TEXT NOT NULL DEFAULT 'Default',
+    symbols         TEXT[] NOT NULL DEFAULT '{}',
+    created_at      TIMESTAMPTZ DEFAULT NOW(),
+    updated_at      TIMESTAMPTZ DEFAULT NOW(),
+    
+    CONSTRAINT unique_user_watchlist_name UNIQUE (user_id, name)
+);
+
+CREATE INDEX IF NOT EXISTS idx_watchlists_user ON watchlists(user_id);
+
+-- Refresh tokens table for JWT auth
+CREATE TABLE IF NOT EXISTS refresh_tokens (
+    id              UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    user_id         UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    token_hash      TEXT NOT NULL,
+    expires_at      TIMESTAMPTZ NOT NULL,
+    revoked_at      TIMESTAMPTZ,
+    created_at      TIMESTAMPTZ DEFAULT NOW(),
+    user_agent      TEXT,
+    ip_address      INET
+);
+
+CREATE INDEX IF NOT EXISTS idx_refresh_tokens_user ON refresh_tokens(user_id);
+CREATE INDEX IF NOT EXISTS idx_refresh_tokens_hash ON refresh_tokens(token_hash);
+
+-- =============================================================================
+-- PORTFOLIO FUNCTIONS
+-- =============================================================================
+
+-- Function to get portfolio summary with real-time P&L
+CREATE OR REPLACE FUNCTION get_portfolio_summary(p_portfolio_id UUID)
+RETURNS TABLE (
+    portfolio_id UUID,
+    portfolio_name TEXT,
+    cash_balance DECIMAL(18, 2),
+    total_invested DECIMAL(18, 2),
+    holdings_count BIGINT,
+    total_cost_basis DECIMAL(18, 2)
+) AS $$
+BEGIN
+    RETURN QUERY
+    SELECT 
+        p.id,
+        p.name,
+        p.current_cash,
+        COALESCE(SUM(h.total_cost), 0)::DECIMAL(18, 2),
+        COUNT(DISTINCT h.symbol),
+        COALESCE(SUM(h.total_cost), 0)::DECIMAL(18, 2)
+    FROM portfolios p
+    LEFT JOIN holdings h ON p.id = h.portfolio_id AND h.quantity > 0
+    WHERE p.id = p_portfolio_id
+    GROUP BY p.id, p.name, p.current_cash;
+END;
+$$ LANGUAGE plpgsql;
+
+-- Function to execute a buy transaction
+CREATE OR REPLACE FUNCTION execute_buy(
+    p_portfolio_id UUID,
+    p_symbol TEXT,
+    p_quantity DECIMAL(18, 8),
+    p_price DECIMAL(18, 8),
+    p_notes TEXT DEFAULT NULL
+)
+RETURNS TABLE (
+    transaction_id UUID,
+    new_quantity DECIMAL(18, 8),
+    new_average_cost DECIMAL(18, 8),
+    remaining_cash DECIMAL(18, 2)
+) AS $$
+DECLARE
+    v_total_amount DECIMAL(18, 2);
+    v_current_cash DECIMAL(18, 2);
+    v_transaction_id UUID;
+    v_current_quantity DECIMAL(18, 8);
+    v_current_cost DECIMAL(18, 2);
+    v_new_quantity DECIMAL(18, 8);
+    v_new_total_cost DECIMAL(18, 2);
+    v_new_avg_cost DECIMAL(18, 8);
+BEGIN
+    -- Calculate total amount
+    v_total_amount := p_quantity * p_price;
+    
+    -- Check available cash
+    SELECT current_cash INTO v_current_cash
+    FROM portfolios WHERE id = p_portfolio_id FOR UPDATE;
+    
+    IF v_current_cash < v_total_amount THEN
+        RAISE EXCEPTION 'Insufficient funds. Available: %, Required: %', v_current_cash, v_total_amount;
+    END IF;
+    
+    -- Deduct cash
+    UPDATE portfolios 
+    SET current_cash = current_cash - v_total_amount,
+        updated_at = NOW()
+    WHERE id = p_portfolio_id
+    RETURNING current_cash INTO v_current_cash;
+    
+    -- Get current holding
+    SELECT quantity, total_cost INTO v_current_quantity, v_current_cost
+    FROM holdings 
+    WHERE portfolio_id = p_portfolio_id AND symbol = p_symbol;
+    
+    IF NOT FOUND THEN
+        v_current_quantity := 0;
+        v_current_cost := 0;
+    END IF;
+    
+    -- Calculate new values
+    v_new_quantity := v_current_quantity + p_quantity;
+    v_new_total_cost := v_current_cost + v_total_amount;
+    v_new_avg_cost := v_new_total_cost / v_new_quantity;
+    
+    -- Upsert holding
+    INSERT INTO holdings (portfolio_id, symbol, quantity, average_cost, total_cost, first_bought_at, last_traded_at)
+    VALUES (p_portfolio_id, p_symbol, v_new_quantity, v_new_avg_cost, v_new_total_cost, NOW(), NOW())
+    ON CONFLICT (portfolio_id, symbol) DO UPDATE SET
+        quantity = v_new_quantity,
+        average_cost = v_new_avg_cost,
+        total_cost = v_new_total_cost,
+        last_traded_at = NOW(),
+        updated_at = NOW();
+    
+    -- Record transaction
+    INSERT INTO transactions (portfolio_id, symbol, transaction_type, quantity, price, total_amount, notes, executed_at)
+    VALUES (p_portfolio_id, p_symbol, 'BUY', p_quantity, p_price, v_total_amount, p_notes, NOW())
+    RETURNING id INTO v_transaction_id;
+    
+    RETURN QUERY SELECT v_transaction_id, v_new_quantity, v_new_avg_cost, v_current_cash;
+END;
+$$ LANGUAGE plpgsql;
+
+-- Function to execute a sell transaction
+CREATE OR REPLACE FUNCTION execute_sell(
+    p_portfolio_id UUID,
+    p_symbol TEXT,
+    p_quantity DECIMAL(18, 8),
+    p_price DECIMAL(18, 8),
+    p_notes TEXT DEFAULT NULL
+)
+RETURNS TABLE (
+    transaction_id UUID,
+    remaining_quantity DECIMAL(18, 8),
+    realized_pnl DECIMAL(18, 2),
+    new_cash DECIMAL(18, 2)
+) AS $$
+DECLARE
+    v_total_amount DECIMAL(18, 2);
+    v_transaction_id UUID;
+    v_current_quantity DECIMAL(18, 8);
+    v_current_avg_cost DECIMAL(18, 8);
+    v_cost_basis DECIMAL(18, 2);
+    v_realized_pnl DECIMAL(18, 2);
+    v_new_quantity DECIMAL(18, 8);
+    v_new_cash DECIMAL(18, 2);
+BEGIN
+    -- Calculate total amount
+    v_total_amount := p_quantity * p_price;
+    
+    -- Get current holding
+    SELECT quantity, average_cost INTO v_current_quantity, v_current_avg_cost
+    FROM holdings 
+    WHERE portfolio_id = p_portfolio_id AND symbol = p_symbol FOR UPDATE;
+    
+    IF NOT FOUND OR v_current_quantity < p_quantity THEN
+        RAISE EXCEPTION 'Insufficient shares. Available: %, Requested: %', 
+            COALESCE(v_current_quantity, 0), p_quantity;
+    END IF;
+    
+    -- Calculate P&L
+    v_cost_basis := p_quantity * v_current_avg_cost;
+    v_realized_pnl := v_total_amount - v_cost_basis;
+    v_new_quantity := v_current_quantity - p_quantity;
+    
+    -- Update holding
+    IF v_new_quantity = 0 THEN
+        DELETE FROM holdings WHERE portfolio_id = p_portfolio_id AND symbol = p_symbol;
+    ELSE
+        UPDATE holdings 
+        SET quantity = v_new_quantity,
+            total_cost = v_new_quantity * average_cost,
+            last_traded_at = NOW(),
+            updated_at = NOW()
+        WHERE portfolio_id = p_portfolio_id AND symbol = p_symbol;
+    END IF;
+    
+    -- Add cash
+    UPDATE portfolios 
+    SET current_cash = current_cash + v_total_amount,
+        updated_at = NOW()
+    WHERE id = p_portfolio_id
+    RETURNING current_cash INTO v_new_cash;
+    
+    -- Record transaction
+    INSERT INTO transactions (portfolio_id, symbol, transaction_type, quantity, price, total_amount, notes, executed_at)
+    VALUES (p_portfolio_id, p_symbol, 'SELL', p_quantity, p_price, v_total_amount, p_notes, NOW())
+    RETURNING id INTO v_transaction_id;
+    
+    RETURN QUERY SELECT v_transaction_id, v_new_quantity, v_realized_pnl, v_new_cash;
+END;
+$$ LANGUAGE plpgsql;
+
+-- Grant permissions
+GRANT ALL PRIVILEGES ON ALL TABLES IN SCHEMA public TO finstream;
+GRANT ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA public TO finstream;
+GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA public TO finstream;
+
+-- =============================================================================
 -- COMPLETION MESSAGE
 -- =============================================================================
 DO $$
 BEGIN
     RAISE NOTICE 'FinStream database initialization complete!';
     RAISE NOTICE 'Tables created: trades, quotes, candles, alerts, symbols';
+    RAISE NOTICE 'Portfolio tables: users, portfolios, holdings, transactions, watchlists';
     RAISE NOTICE 'Continuous aggregates: candles_1m, candles_5m, candles_1h';
     RAISE NOTICE 'Retention policies: trades (7d), quotes (1d), alerts (90d)';
 END $$;
