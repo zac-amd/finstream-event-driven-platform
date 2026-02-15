@@ -1,0 +1,289 @@
+# =============================================================================
+# FinStream - Local Development Environment
+# =============================================================================
+
+x-common-env: &common-env
+  KAFKA_BOOTSTRAP_SERVERS: redpanda:9092
+  SCHEMA_REGISTRY_URL: http://redpanda:8081
+  REDIS_URL: redis://redis:6379
+  TIMESCALE_URL: postgresql://finstream:finstream@timescaledb:5432/finstream
+  JAEGER_AGENT_HOST: jaeger
+  JAEGER_AGENT_PORT: 6831
+  LOG_LEVEL: INFO
+  ENVIRONMENT: development
+
+services:
+  # ===========================================================================
+  # INFRASTRUCTURE SERVICES
+  # ===========================================================================
+
+  redpanda:
+    image: docker.redpanda.com/redpandadata/redpanda:v24.1.1
+    container_name: finstream-redpanda
+    command:
+      - redpanda start
+      - --kafka-addr internal://0.0.0.0:9092,external://0.0.0.0:19092
+      - --advertise-kafka-addr internal://redpanda:9092,external://localhost:19092
+      - --pandaproxy-addr internal://0.0.0.0:8082,external://0.0.0.0:18082
+      - --advertise-pandaproxy-addr internal://redpanda:8082,external://localhost:18082
+      - --schema-registry-addr internal://0.0.0.0:8081,external://0.0.0.0:18081
+      - --rpc-addr redpanda:33145
+      - --advertise-rpc-addr redpanda:33145
+      - --smp 1
+      - --memory 1G
+      - --mode dev-container
+      - --default-log-level=warn
+    ports:
+      - "19092:19092"
+      - "18081:18081"
+      - "18082:18082"
+      - "9644:9644"
+    volumes:
+      - redpanda-data:/var/lib/redpanda/data
+    healthcheck:
+      test: ["CMD-SHELL", "rpk cluster health | grep -E 'Healthy:.+true' || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    networks:
+      - finstream-network
+
+  redpanda-console:
+    image: docker.redpanda.com/redpandadata/console:v2.4.3
+    container_name: finstream-redpanda-console
+    depends_on:
+      redpanda:
+        condition: service_healthy
+    ports:
+      - "8080:8080"
+    environment:
+      KAFKA_BROKERS: redpanda:9092
+      KAFKA_SCHEMAREGISTRY_ENABLED: "true"
+      KAFKA_SCHEMAREGISTRY_URLS: http://redpanda:8081
+    networks:
+      - finstream-network
+
+  redis:
+    image: redis:7.2-alpine
+    container_name: finstream-redis
+    command: redis-server --appendonly yes --maxmemory 256mb --maxmemory-policy allkeys-lru
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    networks:
+      - finstream-network
+
+  timescaledb:
+    image: timescale/timescaledb:latest-pg16
+    container_name: finstream-timescaledb
+    environment:
+      POSTGRES_USER: finstream
+      POSTGRES_PASSWORD: finstream
+      POSTGRES_DB: finstream
+    ports:
+      - "5432:5432"
+    volumes:
+      - timescaledb-data:/var/lib/postgresql/data
+      - ./infrastructure/db/init.sql:/docker-entrypoint-initdb.d/01-init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U finstream -d finstream"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    networks:
+      - finstream-network
+
+  # ===========================================================================
+  # OBSERVABILITY STACK
+  # ===========================================================================
+
+  prometheus:
+    image: prom/prometheus:v2.50.1
+    container_name: finstream-prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--web.enable-lifecycle'
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./observability/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./observability/prometheus/rules:/etc/prometheus/rules:ro
+      - prometheus-data:/prometheus
+    networks:
+      - finstream-network
+
+  grafana:
+    image: grafana/grafana:10.3.3
+    container_name: finstream-grafana
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_USERS_ALLOW_SIGN_UP: "false"
+    ports:
+      - "3001:3000"
+    volumes:
+      - ./observability/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./observability/grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana-data:/var/lib/grafana
+    depends_on:
+      - prometheus
+      - jaeger
+      - loki
+    networks:
+      - finstream-network
+
+  jaeger:
+    image: jaegertracing/all-in-one:1.54
+    container_name: finstream-jaeger
+    environment:
+      COLLECTOR_OTLP_ENABLED: "true"
+    ports:
+      - "6831:6831/udp"
+      - "16686:16686"
+      - "4317:4317"
+      - "4318:4318"
+    networks:
+      - finstream-network
+
+  loki:
+    image: grafana/loki:2.9.4
+    container_name: finstream-loki
+    command: -config.file=/etc/loki/local-config.yaml
+    ports:
+      - "3100:3100"
+    volumes:
+      - ./observability/loki/loki-config.yml:/etc/loki/local-config.yaml:ro
+      - loki-data:/loki
+    networks:
+      - finstream-network
+
+  # Promtail - Log shipping (disabled by default - requires Docker host access)
+  # promtail:
+  #   image: grafana/promtail:2.9.4
+  #   container_name: finstream-promtail
+  #   command: -config.file=/etc/promtail/config.yml
+  #   volumes:
+  #     - ./observability/promtail/promtail-config.yml:/etc/promtail/config.yml:ro
+  #     - /var/lib/docker/containers:/var/lib/docker/containers:ro
+  #     - /var/run/docker.sock:/var/run/docker.sock
+  #   depends_on:
+  #     - loki
+  #   networks:
+  #     - finstream-network
+
+  # ===========================================================================
+  # APPLICATION SERVICES
+  # ===========================================================================
+
+  market-simulator:
+    build:
+      context: .
+      dockerfile: services/market-simulator/Dockerfile
+    container_name: finstream-market-simulator
+    environment:
+      <<: *common-env
+      SERVICE_NAME: market-simulator
+      SYMBOLS: AAPL,GOOGL,MSFT,AMZN,META,NVDA,TSLA,JPM,V,JNJ
+      TRADES_PER_SECOND: 100
+    depends_on:
+      redpanda:
+        condition: service_healthy
+    networks:
+      - finstream-network
+    restart: unless-stopped
+
+  stream-processor:
+    build:
+      context: .
+      dockerfile: services/stream-processor/Dockerfile
+    container_name: finstream-stream-processor
+    environment:
+      <<: *common-env
+      SERVICE_NAME: stream-processor
+    depends_on:
+      redpanda:
+        condition: service_healthy
+      timescaledb:
+        condition: service_healthy
+    networks:
+      - finstream-network
+    restart: unless-stopped
+
+  alert-service:
+    build:
+      context: .
+      dockerfile: services/alert-service/Dockerfile
+    container_name: finstream-alert
+    environment:
+      <<: *common-env
+      SERVICE_NAME: alert-service
+      PRICE_SPIKE_THRESHOLD: 0.05
+      VOLUME_ANOMALY_THRESHOLD: 3.0
+    depends_on:
+      redpanda:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - finstream-network
+    restart: unless-stopped
+
+  api-gateway:
+    build:
+      context: .
+      dockerfile: services/api-gateway/Dockerfile
+    container_name: finstream-api-gateway
+    environment:
+      <<: *common-env
+      SERVICE_NAME: api-gateway
+    ports:
+      - "8000:8080"
+    depends_on:
+      redpanda:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      timescaledb:
+        condition: service_healthy
+    networks:
+      - finstream-network
+    restart: unless-stopped
+
+  dashboard:
+    build:
+      context: ./dashboard
+      dockerfile: Dockerfile
+    container_name: finstream-dashboard
+    ports:
+      - "3000:80"
+    depends_on:
+      - api-gateway
+    networks:
+      - finstream-network
+
+networks:
+  finstream-network:
+    driver: bridge
+    name: finstream-network
+
+volumes:
+  redpanda-data:
+    name: finstream-redpanda-data
+  redis-data:
+    name: finstream-redis-data
+  timescaledb-data:
+    name: finstream-timescaledb-data
+  prometheus-data:
+    name: finstream-prometheus-data
+  grafana-data:
+    name: finstream-grafana-data
+  loki-data:
+    name: finstream-loki-data
