@@ -1,0 +1,255 @@
+# =============================================================================
+# FinStream - Prometheus Alerting Rules
+# =============================================================================
+
+groups:
+  # ===========================================================================
+  # Service Health Alerts
+  # ===========================================================================
+  - name: service_health
+    interval: 30s
+    rules:
+      - alert: ServiceDown
+        expr: up == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Service {{ $labels.service }} is down"
+          description: "{{ $labels.service }} has been unreachable for more than 1 minute."
+
+      - alert: HighErrorRate
+        expr: |
+          sum(rate(http_requests_total{status=~"5.."}[5m])) by (service)
+          /
+          sum(rate(http_requests_total[5m])) by (service)
+          > 0.05
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High error rate on {{ $labels.service }}"
+          description: "Error rate is {{ $value | humanizePercentage }} on {{ $labels.service }}."
+
+      - alert: HighLatency
+        expr: |
+          histogram_quantile(0.95, sum(rate(http_request_duration_seconds_bucket[5m])) by (service, le))
+          > 1
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High latency on {{ $labels.service }}"
+          description: "P95 latency is {{ $value | humanizeDuration }} on {{ $labels.service }}."
+
+  # ===========================================================================
+  # Kafka / Redpanda Alerts
+  # ===========================================================================
+  - name: kafka_alerts
+    interval: 30s
+    rules:
+      - alert: KafkaConsumerLag
+        expr: |
+          kafka_consumer_group_lag > 10000
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High consumer lag on {{ $labels.topic }}"
+          description: "Consumer group {{ $labels.consumer_group }} has lag of {{ $value }} on topic {{ $labels.topic }}."
+
+      - alert: KafkaConsumerLagCritical
+        expr: |
+          kafka_consumer_group_lag > 100000
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Critical consumer lag on {{ $labels.topic }}"
+          description: "Consumer group {{ $labels.consumer_group }} has critical lag of {{ $value }} on topic {{ $labels.topic }}."
+
+      - alert: KafkaBrokerDown
+        expr: |
+          redpanda_cluster_brokers < 1
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Kafka broker down"
+          description: "No Kafka brokers are available."
+
+      - alert: KafkaUnderReplicatedPartitions
+        expr: |
+          redpanda_kafka_under_replicated_replicas > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Under-replicated partitions detected"
+          description: "{{ $value }} partitions are under-replicated."
+
+  # ===========================================================================
+  # FinStream Application Alerts
+  # ===========================================================================
+  - name: finstream_alerts
+    interval: 30s
+    rules:
+      - alert: LowTradeIngestionRate
+        expr: |
+          rate(finstream_trades_produced_total[5m]) < 10
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Low trade ingestion rate"
+          description: "Trade ingestion rate is {{ $value | humanize }} trades/second, expected > 10."
+
+      - alert: TradeIngestionStopped
+        expr: |
+          rate(finstream_trades_produced_total[5m]) == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Trade ingestion has stopped"
+          description: "No trades have been ingested for 2 minutes."
+
+      - alert: HighProcessingLatency
+        expr: |
+          histogram_quantile(0.99, sum(rate(finstream_processing_latency_seconds_bucket[5m])) by (le))
+          > 0.5
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High stream processing latency"
+          description: "P99 processing latency is {{ $value | humanizeDuration }}."
+
+      - alert: CandleAggregationDelayed
+        expr: |
+          time() - finstream_last_candle_timestamp > 120
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Candle aggregation is delayed"
+          description: "Last candle was produced {{ $value | humanizeDuration }} ago."
+
+      - alert: HighAlertRate
+        expr: |
+          rate(finstream_alerts_triggered_total[5m]) > 1
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High alert trigger rate"
+          description: "{{ $value | humanize }} alerts per second are being triggered."
+
+  # ===========================================================================
+  # Database Alerts
+  # ===========================================================================
+  - name: database_alerts
+    interval: 30s
+    rules:
+      - alert: DatabaseConnectionPoolExhausted
+        expr: |
+          pg_stat_activity_count / pg_settings_max_connections > 0.8
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Database connection pool near exhaustion"
+          description: "{{ $value | humanizePercentage }} of database connections are in use."
+
+      - alert: HighDatabaseLatency
+        expr: |
+          histogram_quantile(0.95, sum(rate(pg_stat_statements_seconds_bucket[5m])) by (le))
+          > 0.1
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High database query latency"
+          description: "P95 database query latency is {{ $value | humanizeDuration }}."
+
+      - alert: TimescaleDBChunkCompactionFailing
+        expr: |
+          increase(timescaledb_compression_errors_total[1h]) > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "TimescaleDB chunk compaction failing"
+          description: "Chunk compression is failing. Check TimescaleDB logs."
+
+  # ===========================================================================
+  # Redis Alerts
+  # ===========================================================================
+  - name: redis_alerts
+    interval: 30s
+    rules:
+      - alert: RedisHighMemoryUsage
+        expr: |
+          redis_memory_used_bytes / redis_memory_max_bytes > 0.9
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Redis high memory usage"
+          description: "Redis is using {{ $value | humanizePercentage }} of max memory."
+
+      - alert: RedisConnectedClientsHigh
+        expr: |
+          redis_connected_clients > 100
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High number of Redis clients"
+          description: "{{ $value }} clients are connected to Redis."
+
+      - alert: RedisEvictedKeysHigh
+        expr: |
+          rate(redis_evicted_keys_total[5m]) > 100
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High Redis eviction rate"
+          description: "Redis is evicting {{ $value | humanize }} keys per second."
+
+  # ===========================================================================
+  # Infrastructure Alerts
+  # ===========================================================================
+  - name: infrastructure_alerts
+    interval: 30s
+    rules:
+      - alert: HighCPUUsage
+        expr: |
+          100 - (avg by(instance) (rate(node_cpu_seconds_total{mode="idle"}[5m])) * 100) > 80
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High CPU usage on {{ $labels.instance }}"
+          description: "CPU usage is {{ $value | humanize }}% on {{ $labels.instance }}."
+
+      - alert: HighMemoryUsage
+        expr: |
+          (1 - (node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes)) * 100 > 90
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High memory usage on {{ $labels.instance }}"
+          description: "Memory usage is {{ $value | humanize }}% on {{ $labels.instance }}."
+
+      - alert: DiskSpaceLow
+        expr: |
+          (1 - (node_filesystem_avail_bytes / node_filesystem_size_bytes)) * 100 > 85
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Disk space low on {{ $labels.instance }}"
+          description: "Disk usage is {{ $value | humanize }}% on {{ $labels.instance }} ({{ $labels.mountpoint }})."
