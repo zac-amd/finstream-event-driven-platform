@@ -199,6 +199,49 @@ services:
     networks:
       - finstream-network
     restart: unless-stopped
+    profiles:
+      - simulator  # Use 'docker compose --profile simulator up' to run
+
+  market-data-service:
+    build:
+      context: .
+      dockerfile: services/market-data-service/Dockerfile
+    container_name: finstream-market-data
+    environment:
+      <<: *common-env
+      SERVICE_NAME: market-data-service
+    ports:
+      - "8002:8002"
+    depends_on:
+      redpanda:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - finstream-network
+    restart: unless-stopped
+
+  portfolio-service:
+    build:
+      context: .
+      dockerfile: services/portfolio-service/Dockerfile
+    container_name: finstream-portfolio
+    environment:
+      <<: *common-env
+      SERVICE_NAME: portfolio-service
+      DATABASE_URL: postgresql://finstream:finstream@timescaledb:5432/finstream
+      MARKET_DATA_URL: http://market-data-service:8002
+      JWT_SECRET: ${JWT_SECRET:-change-this-in-production-12345}
+    ports:
+      - "8003:8003"
+    depends_on:
+      timescaledb:
+        condition: service_healthy
+      market-data-service:
+        condition: service_started
+    networks:
+      - finstream-network
+    restart: unless-stopped
 
   stream-processor:
     build:
