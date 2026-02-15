@@ -249,9 +249,39 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
 app = FastAPI(
     title="FinStream Portfolio Service",
-    description="User authentication and portfolio management",
+    description="""
+## Portfolio Management & Paper Trading API
+
+Manage virtual portfolios and execute paper trades with real market data.
+
+### Features
+- **User Authentication**: Register, login, and JWT token management
+- **Portfolio Management**: Create and manage multiple portfolios
+- **Paper Trading**: Buy and sell stocks using real-time Yahoo Finance prices
+- **P&L Tracking**: Real-time profit/loss calculation for holdings
+- **Leaderboard**: Public portfolio rankings
+
+### Authentication
+All portfolio and trading endpoints require JWT authentication.
+1. Register or login to get an access token
+2. Include the token in the `Authorization` header: `Bearer <token>`
+
+### Paper Trading
+- Start with $10,000 virtual cash
+- Execute trades at real market prices
+- Track your portfolio performance over time
+    """,
     version="1.0.0",
     lifespan=lifespan,
+    openapi_tags=[
+        {"name": "Health", "description": "Service health endpoints"},
+        {"name": "Authentication", "description": "User registration and login"},
+        {"name": "Portfolios", "description": "Portfolio management"},
+        {"name": "Trading", "description": "Buy and sell stocks"},
+        {"name": "Public", "description": "Public endpoints (no auth required)"},
+    ],
+    docs_url="/docs",
+    redoc_url="/redoc",
 )
 
 app.add_middleware(
@@ -267,13 +297,15 @@ app.add_middleware(
 # HEALTH ENDPOINTS
 # =============================================================================
 
-@app.get("/health")
+@app.get("/health", tags=["Health"])
 async def health():
+    """Check service health status."""
     return {"status": "healthy", "service": "portfolio-service"}
 
 
-@app.get("/ready")
+@app.get("/ready", tags=["Health"])
 async def ready():
+    """Check if service is ready to accept traffic."""
     return {"status": "ready" if pool else "not_ready"}
 
 
@@ -281,9 +313,14 @@ async def ready():
 # AUTH ENDPOINTS
 # =============================================================================
 
-@app.post("/api/v1/auth/register", response_model=UserResponse, status_code=201)
+@app.post("/api/v1/auth/register", response_model=UserResponse, status_code=201, tags=["Authentication"])
 async def register(user_data: UserCreate, db: asyncpg.Pool = Depends(get_db)):
-    """Register a new user."""
+    """
+    Register a new user account.
+    
+    Creates a new user with the provided email, username, and password.
+    A default portfolio with $10,000 virtual cash is automatically created.
+    """
     # Check if email or username exists
     existing = await db.fetchrow(
         "SELECT email FROM users WHERE email = $1 OR username = $2",
@@ -317,9 +354,14 @@ async def register(user_data: UserCreate, db: asyncpg.Pool = Depends(get_db)):
     return UserResponse(id=str(user["id"]), **{k: v for k, v in dict(user).items() if k != "id"})
 
 
-@app.post("/api/v1/auth/login", response_model=TokenResponse)
+@app.post("/api/v1/auth/login", response_model=TokenResponse, tags=["Authentication"])
 async def login(credentials: UserLogin, db: asyncpg.Pool = Depends(get_db)):
-    """Login and get access token."""
+    """
+    Login with email and password to obtain JWT tokens.
+    
+    Returns an access token (30 min) and refresh token (7 days).
+    Include the access token in the Authorization header for protected endpoints.
+    """
     user = await db.fetchrow(
         "SELECT id, password_hash, is_active FROM users WHERE email = $1",
         credentials.email
@@ -349,9 +391,13 @@ async def login(credentials: UserLogin, db: asyncpg.Pool = Depends(get_db)):
     )
 
 
-@app.get("/api/v1/auth/me", response_model=UserResponse)
+@app.get("/api/v1/auth/me", response_model=UserResponse, tags=["Authentication"])
 async def get_me(current_user: dict = Depends(get_current_user)):
-    """Get current user profile."""
+    """
+    Get the current authenticated user's profile.
+    
+    Requires valid JWT access token in Authorization header.
+    """
     return UserResponse(
         id=str(current_user["id"]),
         email=current_user["email"],
@@ -366,12 +412,16 @@ async def get_me(current_user: dict = Depends(get_current_user)):
 # PORTFOLIO ENDPOINTS
 # =============================================================================
 
-@app.get("/api/v1/portfolios", response_model=list[PortfolioResponse])
+@app.get("/api/v1/portfolios", response_model=list[PortfolioResponse], tags=["Portfolios"])
 async def list_portfolios(
     current_user: dict = Depends(get_current_user),
     db: asyncpg.Pool = Depends(get_db)
 ):
-    """List all portfolios for current user."""
+    """
+    List all portfolios owned by the current user.
+    
+    Returns portfolio metadata including cash balances and settings.
+    """
     rows = await db.fetch(
         """
         SELECT id, name, description, initial_cash, current_cash, is_default, is_public, created_at
@@ -382,13 +432,19 @@ async def list_portfolios(
     return [PortfolioResponse(id=str(r["id"]), **{k: v for k, v in dict(r).items() if k != "id"}) for r in rows]
 
 
-@app.post("/api/v1/portfolios", response_model=PortfolioResponse, status_code=201)
+@app.post("/api/v1/portfolios", response_model=PortfolioResponse, status_code=201, tags=["Portfolios"])
 async def create_portfolio(
     data: PortfolioCreate,
     current_user: dict = Depends(get_current_user),
     db: asyncpg.Pool = Depends(get_db)
 ):
-    """Create a new portfolio."""
+    """
+    Create a new portfolio with specified initial cash.
+    
+    - **name**: Portfolio name (required)
+    - **initial_cash**: Starting virtual cash (default: $10,000)
+    - **is_public**: Whether to show on leaderboard
+    """
     row = await db.fetchrow(
         """
         INSERT INTO portfolios (user_id, name, description, initial_cash, current_cash, is_public)
@@ -400,13 +456,21 @@ async def create_portfolio(
     return PortfolioResponse(id=str(row["id"]), **{k: v for k, v in dict(row).items() if k != "id"})
 
 
-@app.get("/api/v1/portfolios/{portfolio_id}/summary", response_model=PortfolioSummary)
+@app.get("/api/v1/portfolios/{portfolio_id}/summary", response_model=PortfolioSummary, tags=["Portfolios"])
 async def get_portfolio_summary(
     portfolio_id: str,
     current_user: dict = Depends(get_current_user),
     db: asyncpg.Pool = Depends(get_db)
 ):
-    """Get portfolio summary with real-time P&L."""
+    """
+    Get detailed portfolio summary with real-time P&L.
+    
+    Includes:
+    - Cash balance
+    - All holdings with current market prices
+    - Unrealized P&L per holding and total
+    - Portfolio total value
+    """
     # Verify ownership
     portfolio = await db.fetchrow(
         "SELECT * FROM portfolios WHERE id = $1 AND user_id = $2",
@@ -480,14 +544,23 @@ async def get_portfolio_summary(
 # TRADING ENDPOINTS
 # =============================================================================
 
-@app.post("/api/v1/portfolios/{portfolio_id}/buy", response_model=TradeResponse)
+@app.post("/api/v1/portfolios/{portfolio_id}/buy", response_model=TradeResponse, tags=["Trading"])
 async def buy_stock(
     portfolio_id: str,
     trade: TradeRequest,
     current_user: dict = Depends(get_current_user),
     db: asyncpg.Pool = Depends(get_db)
 ):
-    """Buy shares of a stock."""
+    """
+    Execute a buy order for shares of a stock.
+    
+    - Fetches real-time price from Yahoo Finance
+    - Deducts cost from cash balance
+    - Creates or updates holding position
+    - Records transaction history
+    
+    Raises error if insufficient cash.
+    """
     # Verify ownership
     portfolio = await db.fetchrow(
         "SELECT id FROM portfolios WHERE id = $1 AND user_id = $2",
@@ -528,14 +601,23 @@ async def buy_stock(
     )
 
 
-@app.post("/api/v1/portfolios/{portfolio_id}/sell", response_model=TradeResponse)
+@app.post("/api/v1/portfolios/{portfolio_id}/sell", response_model=TradeResponse, tags=["Trading"])
 async def sell_stock(
     portfolio_id: str,
     trade: TradeRequest,
     current_user: dict = Depends(get_current_user),
     db: asyncpg.Pool = Depends(get_db)
 ):
-    """Sell shares of a stock."""
+    """
+    Execute a sell order for shares of a stock.
+    
+    - Fetches real-time price from Yahoo Finance
+    - Adds proceeds to cash balance
+    - Reduces holding position
+    - Records realized P&L
+    
+    Raises error if insufficient shares.
+    """
     # Verify ownership
     portfolio = await db.fetchrow(
         "SELECT id FROM portfolios WHERE id = $1 AND user_id = $2",
@@ -577,14 +659,18 @@ async def sell_stock(
     )
 
 
-@app.get("/api/v1/portfolios/{portfolio_id}/transactions", response_model=list[TransactionResponse])
+@app.get("/api/v1/portfolios/{portfolio_id}/transactions", response_model=list[TransactionResponse], tags=["Portfolios"])
 async def get_transactions(
     portfolio_id: str,
     limit: int = 50,
     current_user: dict = Depends(get_current_user),
     db: asyncpg.Pool = Depends(get_db)
 ):
-    """Get transaction history for a portfolio."""
+    """
+    Get transaction history for a portfolio.
+    
+    Returns buy/sell transactions in reverse chronological order.
+    """
     # Verify ownership
     portfolio = await db.fetchrow(
         "SELECT id FROM portfolios WHERE id = $1 AND user_id = $2",
@@ -609,12 +695,17 @@ async def get_transactions(
 # PUBLIC PORTFOLIOS (LEADERBOARD)
 # =============================================================================
 
-@app.get("/api/v1/leaderboard")
+@app.get("/api/v1/leaderboard", tags=["Public"])
 async def get_leaderboard(
     limit: int = 10,
     db: asyncpg.Pool = Depends(get_db)
 ):
-    """Get top public portfolios by total value."""
+    """
+    Get top public portfolios ranked by total value.
+    
+    No authentication required.
+    Shows portfolio name, username, total value, and return percentage.
+    """
     rows = await db.fetch(
         """
         SELECT p.id, p.name, u.username,

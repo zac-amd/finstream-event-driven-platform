@@ -304,9 +304,9 @@ SELECT add_compression_policy('candles', INTERVAL '1 day', if_not_exists => TRUE
 -- Function to get latest price for a symbol
 CREATE OR REPLACE FUNCTION get_latest_price(p_symbol TEXT)
 RETURNS TABLE (
-    symbol TEXT,
-    price DECIMAL(18, 8),
-    timestamp TIMESTAMPTZ
+    out_symbol TEXT,
+    out_price DECIMAL(18, 8),
+    out_timestamp TIMESTAMPTZ
 ) AS $$
 BEGIN
     RETURN QUERY

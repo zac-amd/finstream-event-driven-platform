@@ -10,7 +10,13 @@ interface MarketSummary {
 
 async function fetchMarketSummary(): Promise<{ summary: MarketSummary[] }> {
   const res = await fetch('/api/v1/market-summary')
-  return res.json()
+  if (!res.ok) {
+    console.error('Market summary fetch failed:', res.status, res.statusText)
+    return { summary: [] }
+  }
+  const data = await res.json()
+  console.log('Market data:', data)
+  return data
 }
 
 export default function Dashboard() {
